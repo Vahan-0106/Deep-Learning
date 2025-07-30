@@ -18,19 +18,87 @@ RDLogger.DisableLog('rdApp.*')
 from sklearn.model_selection import StratifiedKFold
 from rdkit.Chem import AllChem
 
-def get_morgan_fp(smiles_list, radius=2, n_bits=2048):
-    fps = []
-    for smi in smiles_list:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
+#Used for augmentation
+def randomize_smiles(smiles, n_aug=10):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return []
+    
+    augmented = set()
+    for _ in range(n_aug):
+        rand_smiles = Chem.MolToSmiles(mol, doRandom=True)
+        augmented.add(rand_smiles)
+    return list(augmented)
 
-            fp = np.zeros(n_bits, dtype=np.float32)
-        else:
-            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
-            fp = np.array(fp, dtype=np.float32)
-        fps.append(fp)
-    return np.stack(fps) 
+#Custom Dataset
+class TDCWrapperDataset(Dataset):
+    def __init__(self, dataframe):
+        self.data = dataframe
 
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        smiles = self.data.iloc[idx]['Drug']
+        label = self.data.iloc[idx]['Y']
+        return smiles, label
+
+#Loading and splitting data
+data = ADME(name = 'pgp_broccatelli')
+split = data.get_split()
+
+train_df = split['train']
+valid_df = split['valid']
+test_df = split['test']
+
+smiles_list = train_df['Drug'].to_list()
+
+targets = train_df['Y'].to_list()
+
+augmented_data = []
+
+for _, row in train_df.iterrows():
+    smiles = row['Drug']
+    label = row['Y']
+    
+    augmented_data.append((smiles, label))  # original
+
+    for new_smiles in randomize_smiles(smiles, n_aug=12):
+        augmented_data.append((new_smiles, label)) 
+
+#Adding new SMILES into the train dataset
+import pandas as pd
+train_df = pd.DataFrame(augmented_data, columns=['Drug', 'Y'])
+
+#Regex tokenizer
+def tokenize_smiles(smiles):
+    pattern =  "(?:\[[^\[\]]{1,10}\])" + "|" + \
+               "Cl|Br" + "|" + \
+               "\%\d{2}|\d" + "|" + \
+               "\=|\#|\-|\+|\\\\|\/|\(|\)|\.|:|~|@|\?|>|<|\*|\$|\!|\||\{|\}|" + \
+               "[A-Z][a-z]?" 
+
+    regex = re.compile(pattern)
+    tokens = regex.findall(smiles)
+    
+    return tokens
+
+#Creating vocabulary based on the augmented training dataset
+vocab = {
+    '<PAD>' : 0,
+    '<UNK>' : 2,
+    '<CLS>' : 1
+}
+k = 3
+for i in range(len(smiles_list)):
+    for token in tokenize_smiles(smiles_list[i]):
+        if token not in vocab:
+            vocab[token] = k
+            k += 1
+
+M = len(vocab)
+
+#Loading additional molecule features to use in the classifier layer
 def get_rdkit_features(smiles_list):
     features = []
     for smiles in smiles_list:
@@ -56,81 +124,7 @@ def get_rdkit_features(smiles_list):
             ])
     return torch.tensor(features, dtype=torch.float)
 
-def randomize_smiles(smiles, n_aug=10):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return []
-    
-    augmented = set()
-    for _ in range(n_aug):
-        rand_smiles = Chem.MolToSmiles(mol, doRandom=True)
-        augmented.add(rand_smiles)
-    return list(augmented)
-
-
-class TDCWrapperDataset(Dataset):
-    def __init__(self, dataframe):
-        self.data = dataframe
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        smiles = self.data.iloc[idx]['Drug']
-        label = self.data.iloc[idx]['Y']
-        return smiles, label
-
-data = ADME(name = 'pgp_broccatelli')
-split = data.get_split()
-
-train_df = split['train']
-valid_df = split['valid']
-test_df = split['test']
-
-smiles_list = train_df['Drug'].to_list()
-
-targets = train_df['Y'].to_list()
-def tokenize_smiles(smiles):
-    pattern =  "(?:\[[^\[\]]{1,10}\])" + "|" + \
-               "Cl|Br" + "|" + \
-               "\%\d{2}|\d" + "|" + \
-               "\=|\#|\-|\+|\\\\|\/|\(|\)|\.|:|~|@|\?|>|<|\*|\$|\!|\||\{|\}|" + \
-               "[A-Z][a-z]?" 
-
-    regex = re.compile(pattern)
-    tokens = regex.findall(smiles)
-    
-    return tokens
-augmented_data = []
-
-for _, row in train_df.iterrows():
-    smiles = row['Drug']
-    label = row['Y']
-    
-    augmented_data.append((smiles, label))  # original
-
-    for new_smiles in randomize_smiles(smiles, n_aug=12):
-        augmented_data.append((new_smiles, label)) 
-
-
-import pandas as pd
-train_df = pd.DataFrame(augmented_data, columns=['Drug', 'Y'])
-
-vocab = {
-    '<PAD>' : 0,
-    '<UNK>' : 2,
-    '<CLS>' : 1
-}
-k = 3
-for i in range(len(smiles_list)):
-    for token in tokenize_smiles(smiles_list[i]):
-        if token not in vocab:
-            vocab[token] = k
-            k += 1
-
-M = len(vocab)
-
-
+#Positional encoding model
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=200):
         super(PositionalEncoding, self).__init__()
@@ -149,6 +143,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1)].detach() 
 
+#Tokenizing and determining the padding for gven smiles
 def prep_molecule(smiles):
     result, all_indices = [], []
     max = 0
@@ -199,7 +194,6 @@ class Model(nn.Module):
 
     def forward(self, X):
         features = get_rdkit_features(X)
-        fingerprint = get_morgan_fp(X)
         X, padding = prep_molecule(X)
         X = torch.tensor(X)
         
@@ -214,12 +208,11 @@ class Model(nn.Module):
         cls = output[:,0,:]
 
         result = torch.cat([cls, add_features], dim = 1)
-        #result = torch.cat([cls,add_features, torch.tensor(fingerprint)], dim = 1)
+
         logits = self.classifier(result)
         return logits
     
 if __name__ == "__main__":  
-    print(len(train_df)) 
     num_epochs = 15
     d_model = 128
     num_head = 8
@@ -242,7 +235,6 @@ if __name__ == "__main__":
         train_loss = 0.0
         train_correct = 0
         train_total = 0
-        #pdb.set_trace()
 
         for smiles, labels in train_loader:
             labels  = labels.float().view(-1, 1)
